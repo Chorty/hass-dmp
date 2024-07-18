@@ -25,6 +25,7 @@ from .const import (DOMAIN, LISTENER, CONF_PANEL_IP, LISTENER,
                     CONF_HOME_AREA, CONF_AWAY_AREA, DOMAIN, CONF_ZONES,
                     CONF_ZONE_NUMBER)
 from .dmp_codes import DMP_EVENTS, DMP_TYPES
+from .dmp_sender import DMPSender
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -57,6 +58,9 @@ async def async_setup_entry(hass, entry) -> bool:
     )
     await hass.config_entries.async_forward_entry_setup(entry, "binary_sensor")
     await hass.config_entries.async_forward_entry_setup(entry, "sensor")
+    await hass.config_entries.async_forward_entry_setup(entry, "switch")
+    await hass.config_entries.async_forward_entry_setup(entry, "button")
+    hass.async_create_task(listener.updateStatus())
     return True
 
 
@@ -128,6 +132,7 @@ class DMPPanel():
         self._panelPort = config.get(CONF_PANEL_REMOTE_PORT) or 2001
         self._panel_last_contact = None
         self._area = STATE_ALARM_DISARMED  # Default Value
+        self._dmpSender = DMPSender(self._ipAddress, self._panelPort, self._accountNumber, self._remoteKey)
         self._open_close_zones = {}
         self._battery_zones = {}
         self._trouble_zones = {}
@@ -290,34 +295,7 @@ class DMPPanel():
 
     def getAccountNumber(self):
         return self._accountNumber
-
-    async def connectAndSend(self, sToSend):
-        reader, writer = await asyncio.open_connection(self._ipAddress,
-                                                       self._panelPort)
-
-        # drop any existing connection
-        writer.write('@ {}!V0\r'.format(self._accountNumber).encode())
-        await writer.drain()
-        await asyncio.sleep(2)
-        # send auth string
-        writer.write('@ {}!V2{}\r'.format(self._accountNumber,
-                                          self._remoteKey).encode())
-        await writer.drain()
-        await asyncio.sleep(0.2)
-        # write single string to the receiver
-        writer.write('@ {}{}\r'.format(self._accountNumber, sToSend).encode())
-        await writer.drain()
-        await asyncio.sleep(0.2)
-        # disconnect
-        writer.write('@ {}!V0\r'.format(self._accountNumber).encode())
-        await writer.drain()
-        # close the socket
-        writer.close()
-        await writer.wait_closed()
-        data = await reader.read(256)
-        _LOGGER.debug("DMP: Received data after command: {}".format(data))
-
-
+    
 class DMPListener():
     def __init__(self, hass, config):
         self._hass = hass
@@ -507,6 +485,8 @@ class DMPListener():
                     areaName = out[1]
                     if (systemCode == "OP"):  # Disarm
                         areaState = STATE_ALARM_DISARMED
+                        # do a manual status query - bypassed zones are reset but no message for it 
+                        self._hass.async_create_task(self.updateStatus())
                     elif (systemCode == "CL"):  # Arm
                         if (areaNumber[1:] == self._home_area):
                             # Make sure we're not already armed away
@@ -551,9 +531,43 @@ class DMPListener():
                 # update contact time last to ensure we only log contact time
                 # on a successful message
                 panel.updateContactTime(datetime.utcnow())
-                # call to update the hass object
-                for callback in self._callbacks:
-                    await callback()
+                await self.updateHASS()
             else:
                 _LOGGER.debug("Connection disconnected")
                 connected = False
+
+    async def updateStatus(self):
+        for panelName, panel in self._panels.items():
+            status = await panel._dmpSender.status()
+            areaStatus = status[0]
+            zoneStatus = status[1]
+            for zone, zoneData in zoneStatus.items():
+                faultZone = {"zoneNumber": zone, "zoneState": True}
+                clearZone = {"zoneNumber": zone, "zoneState": False}
+
+                if zone in panel._open_close_zones:
+                    if zoneData['status'] == 'Open' or zoneData['status'] == 'Short':
+                        panel.updateOpenCloseZone(zone, faultZone)
+                    elif zoneData['status'] == 'Normal':
+                        panel.updateOpenCloseZone(zone, clearZone)
+                if zone in panel._bypass_zones:
+                    if zoneData['status'] == 'Bypassed':
+                        panel.updateBypassZone(zone, faultZone)
+                    else:
+                        panel.updateBypassZone(zone, clearZone)
+                if zone in panel._trouble_zones:
+                    if zoneData['status'] == 'Missing':
+                        panel.updateTroubleZone(zone, faultZone)
+                    elif zoneData['status'] == 'Normal':
+                        panel.updateTroubleZone(zone, clearZone)
+                if zone in panel._battery_zones:
+                    if zoneData['status'] == 'Low Battery':
+                        panel.updateBatteryZone(zone, faultZone)
+                    elif zoneData['status'] == 'Normal':
+                        panel.updateBatteryZone(zone, clearZone)
+        await self.updateHASS()
+
+    async def updateHASS(self):
+        # call to update the hass object
+        for callback in self._callbacks:
+            await callback()
